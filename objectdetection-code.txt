@@ -1,0 +1,162 @@
+# OBJECT DETECTION USING MS COCO DATASET - FASTER R-CNN
+
+# Aishwarya Belakavadi Subrahmanya
+# belakavadisubrahma.a@northeastern.edu
+# NUID: 002820128
+
+# Libraries
+import os
+import torch
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.transforms import Compose, ToTensor, Normalize
+from torchvision.datasets import CocoDetection
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
+import torchvision.transforms.functional as F
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+import json
+import time
+
+# Data Loading
+root_dir = '/Users/aishwaryabs/Desktop/Sem 3/Neural Networks/project/coco_dataset'
+train_dir = os.path.join(root_dir, 'train2017')
+val_dir = os.path.join(root_dir, 'val2017')
+test_dir = os.path.join(root_dir, 'test2017')
+train_ann_file = os.path.join(root_dir, 'annotations/instances_train2017.json')
+val_ann_file = os.path.join(root_dir, 'annotations/instances_val2017.json')
+
+# Image transformations
+transform = Compose([
+    ToTensor(),
+    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Datasets and Data Loaders
+train_dataset = CocoDetection(root=train_dir, annFile=train_ann_file, transform=transform)
+val_dataset = CocoDetection(root=val_dir, annFile=val_ann_file, transform=transform)
+
+train_loader = DataLoader(
+    train_dataset, batch_size=2, shuffle=True, collate_fn=lambda x: tuple(zip(*x))
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=2, shuffle=False, collate_fn=lambda x: tuple(zip(*x))
+)
+
+# Faster R-CNN Model
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+num_classes = 81  # MS COCO: 80 categories + 1 background
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+model.to(device)
+
+# Optimizer and Scheduler
+optimizer = torch.optim.SGD(model.parameters(), lr=0.00125, momentum=0.9, weight_decay=0.0005)
+lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.1)
+
+# Training Function
+def train_one_epoch(model, optimizer, data_loader, device, epoch):
+    model.train()
+    epoch_loss = 0
+    for images, targets in tqdm(data_loader, desc=f"Epoch {epoch} Training"):
+        images = list(image.to(device) for image in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+        epoch_loss += losses.item()
+    return epoch_loss / len(data_loader)
+
+# IOU Calculation
+def calculate_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = box1_area + box2_area - inter_area
+    return inter_area / union_area if union_area > 0 else 0
+
+# Precision, Recall, F1-Score Calculation
+def calculate_precision_recall(predictions, ground_truths, iou_threshold=0.5):
+    tp, fp, fn = 0, 0, 0
+    for pred, gt in zip(predictions, ground_truths):
+        pred_boxes = pred["boxes"].cpu().numpy()
+        pred_labels = pred["labels"].cpu().numpy()
+        gt_boxes = gt["boxes"].cpu().numpy()
+        gt_labels = gt["labels"].cpu().numpy()
+
+        matched_gt = set()
+        for pred_box, pred_label in zip(pred_boxes, pred_labels):
+            best_iou = 0
+            best_gt_idx = -1
+            for gt_idx, (gt_box, gt_label) in enumerate(zip(gt_boxes, gt_labels)):
+                if gt_idx in matched_gt or pred_label != gt_label:
+                    continue
+                iou = calculate_iou(pred_box, gt_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = gt_idx
+            if best_iou >= iou_threshold and best_gt_idx != -1:
+                tp += 1
+                matched_gt.add(best_gt_idx)
+            else:
+                fp += 1
+        fn += len(gt_boxes) - len(matched_gt)
+
+    precision = tp / (tp + fp) if tp + fp > 0 else 0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0
+    f1_score = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0
+    return precision, recall, f1_score
+
+# Training
+num_epochs = 40
+for epoch in range(num_epochs):
+    train_loss = train_one_epoch(model, optimizer, train_loader, device, epoch)
+    lr_scheduler.step()
+    print(f"Epoch {epoch+1} - Train Loss: {train_loss:.4f}")
+
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, num_epochs + 1), training_losses, marker='o', linestyle='-', color='b', label='Training Loss')
+plt.title("Training Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.grid(True)
+plt.savefig("training_loss_curve.png")  
+plt.show()
+# Evaluation After Training
+val_annotations = os.path.join(root_dir, 'annotations/instances_val2017.json')
+precision, recall, f1_score = calculate_precision_recall(val_loader.dataset, val_loader.dataset)
+print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1_score:.4f}")
+
+# Testing
+model.eval()
+with torch.no_grad():
+    test_images = os.listdir(test_dir)
+    
+    # Randomly selecting 10 images from the test set
+    selected_images = random.sample(test_images, 10)
+    
+    for test_image_name in selected_images:
+        test_image_path = os.path.join(test_dir, test_image_name)
+        test_image = Image.open(test_image_path).convert("RGB")
+        test_transform = ToTensor()
+        test_image_tensor = test_transform(test_image).to(device)
+        predictions = model([test_image_tensor])
+        
+        # Draw predictions on the image
+        output_image = draw_predictions(test_image, predictions[0])
+        
+    
+
+
